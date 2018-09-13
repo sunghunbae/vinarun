@@ -1,5 +1,6 @@
 # vinarun
 Setup, Run, and Find the best pose using the Autodock Vina
+
 Implemented the Feinstein and Brylinski's finding about the search space in Vina 
 
 ## Optimal box size for Autodock Vina is 2.9 times of ligand Rg
