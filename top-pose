@@ -1,0 +1,230 @@
+#!/usr/bin/env /home/shbae/anaconda3/envs/work/bin/python
+
+from __future__ import print_function
+
+import glob
+import os
+import math
+import sys
+import operator
+import collections
+from rdkit import Chem
+
+rmsd_threshold  = 2.0
+score_threshold = 0.2
+top_count_threshold = 3
+top_score_threshold = 1.0
+
+globdir = sys.argv[1]
+docked_pdbqt = sorted(glob.glob("%s/*/*.pdbqt" % globdir))
+
+# class AutoVivification(dict):
+#     """Implementation of perl's autovivification feature."""
+#     def __getitem__(self, item):
+#         try:
+#             return dict.__getitem__(self, item)
+#         except KeyError:
+#             value = self[item] = type(self)()
+#             return value
+
+atom = collections.namedtuple("atom", ["serial", "name", "resname", "x", "y", "z"])
+pose = collections.namedtuple("pose", ["rec", "model", "score", "atoms", "pdbqt","count"])
+
+def get_rmsd(a, b):
+    rmsd = 0.0
+    n = 0
+    for (atom1, atom2) in zip(a, b):
+        assert atom1.name == atom2.name
+        rmsd += (atom1.x - atom2.x) ** 2
+        rmsd += (atom1.y - atom2.y) ** 2
+        rmsd += (atom1.z - atom2.z) ** 2
+        n += 1
+    return math.sqrt(rmsd / n)
+
+def aggregate_poses (poses, pdbqt):
+    with open(pdbqt, "r") as f:
+        prefix = os.path.basename(pdbqt).split(".")[0] # rec_lig_repeat.pdbqt
+        rec,lig,repeat = prefix.split("_") # use underscore
+        for line in f:
+            if line.startswith("MODEL"):
+                model = int(line.rstrip().split()[1])
+                atoms = []
+            if line.startswith("REMARK VINA RESULT:"):
+                score = float(line.split()[3])
+            if line.startswith("HETATM"):
+                (hetatm_, serial, name, resname, chain,
+                 x, y, z, d1_, d2_, q, atomtype) = \
+                    line.rstrip().split()
+                atoms.append(atom(serial=int(serial),
+                                  name=name,
+                                  resname=resname,
+                                  x=float(x),
+                                  y=float(y),
+                                  z=float(z),
+                                  )
+                             )
+            if line.startswith("ENDMDL"):
+                if not lig in poses:
+                    poses[lig] = [pose(rec=rec,
+                                        model=model,
+                                        score=score,
+                                        atoms=atoms,
+                                        pdbqt=pdbqt,
+                                        count=1)]
+                else:
+                    pose_added = False
+                    for prev_pose in poses[lig]:
+                        if prev_pose.rec != rec :
+                            continue
+                        rmsd = get_rmsd(prev_pose.atoms, atoms)
+                        if rmsd < rmsd_threshold and \
+                            abs(prev_pose.score - score) < score_threshold:
+                            # because namedtuple is immutable, item has to
+                            # be removed and appended
+                            poses[lig].remove(prev_pose)
+                            poses[lig].append(
+                                pose(rec=rec,
+                                    model=model,
+                                    score=score,
+                                    atoms=atoms,
+                                    pdbqt=pdbqt,
+                                    count=prev_pose.count+1))
+                            pose_added = True
+                            break
+                    if not pose_added:
+                        poses[lig].append(
+                            pose(rec=rec,
+                                    model=model,
+                                    score=score,
+                                    atoms=atoms,
+                                    pdbqt=pdbqt,
+                                    count=1))
+
+def copy_pose(pose):
+    pdbqtmodel = os.path.basename(pose.pdbqt).replace(".pdbqt","") + \
+            "_m%02d.pdbqt" % int(pose.model)
+    wanted = "MODEL " + str(pose.model)
+    with open(pose.pdbqt,"r") as f, open(pdbqtmodel,"w") as g:
+        wrflag = False
+        for line in f:
+            line = line.strip()
+            if line.startswith(wanted):
+                wrflag = True
+            if wrflag:
+                g.write(line+"\n")
+            if line.startswith("ENDMDL"):
+                wrflag = False
+
+def read_pdbqt_lines(pdbqtfile, model_number):
+    pdbqt_lines = []
+    model_line = "MODEL " + str(model_number)
+    with open(pdbqtfile,"r") as f:
+        wrflag = False
+        for line in f:
+            line = line.strip()
+            if line.startswith(model_line):
+                wrflag = True
+            if wrflag:
+                pdbqt_lines.append(line)
+            if line.startswith("ENDMDL"):
+                wrflag = False
+    return pdbqt_lines
+
+def convert_to_pdb_block (pdbqt_lines,removeHs=True):
+    pdb_lines = []
+    data = {}
+    for line in pdbqt_lines:
+        if line[:12] == 'REMARK  Name':
+            name = line[15:].strip()
+        elif line[:18] == 'REMARK VINA RESULT':
+            tmp = line[19:].split()
+            data['vina_affinity'] = tmp[0]
+            data['vina_rmsd_lb'] = tmp[1]
+            data['vina_rmsd_ub'] = tmp[2]
+
+        if not line.startswith(('ATOM','HETATM')):
+            continue
+
+        pdb_line = line[:56]
+        pdb_line += '1.00  0.00           '
+
+        # Do proper atom type lookup
+        atom_type = line[71:].split()[1]
+        if atom_type == 'A':
+            atom_type = 'C'
+        elif atom_type[:1] == 'O':
+            atom_type = 'O'
+        elif atom_type[:1] == 'H':
+            atom_type = 'H'
+            if removeHs:
+                continue
+        elif atom_type == 'NA':
+            atom_type = 'N'
+        pdb_lines.append(pdb_line + atom_type)
+    pdb_block = '\n'.join(pdb_lines)
+    return pdb_block, data
+
+def save_as_pdb(pose, pose_idx, sanitize=True, removeHs=True):
+    """Copy a pose in the PDBQT fromat as a PDB
+    Parameters
+    ----------
+        pose: docked pose .pdbqt
+        sanitize: bool (default=True)
+            Should the sanitization be performed
+        removeHs: bool (default=True)
+            Should hydrogens be removed when reading molecule.
+    """
+    name = "_".join(os.path.basename(pose.pdbqt).split("_")[:2]) + "_%02d" % pose_idx
+    pdbfile = name + ".pdb"
+    pdbqt_lines = read_pdbqt_lines (pose.pdbqt, pose.model)
+    pdb_block, data = convert_to_pdb_block (pdbqt_lines,removeHs)
+    mol = Chem.MolFromPDBBlock(pdb_block, sanitize=False)
+    if sanitize:
+        Chem.SanitizeMol(mol)
+    else:
+        Chem.GetSSSR(mol)
+    new_order = sorted(range(mol.GetNumAtoms()),
+                       key=lambda i: (mol.GetAtomWithIdx(i)
+                                      .GetPDBResidueInfo()
+                                      .GetSerialNumber()))
+    mol = Chem.RenumberAtoms(mol, new_order)
+    mol.SetProp('_Name', name)
+    for k, v in data.items():
+        mol.SetProp(str(k), str(v))
+    Chem.MolToPDBFile(mol, pdbfile)
+    return pdbfile
+
+def main() :
+    poses = {}
+    with open("top-pose.txt","w") as f:
+        for pdbqt in docked_pdbqt:
+            aggregate_poses(poses, pdbqt)
+        for lig in sorted(poses):
+            ranked = sorted(poses[lig], key=operator.attrgetter('rec','score'))
+            receptors = set([ r.rec for r in ranked ])
+            for rec in receptors:
+                top_pose = None
+                pose_idx = 1
+                for i, pose in enumerate([p for p in ranked if p.rec == rec]):
+                    txtout = "{0:15} {1:5.1f} n {2:2} {3:45} m {4:2}".format(
+                        lig,pose.score,pose.count,pose.pdbqt,pose.model)
+                    print(txtout,end='')
+                    f.write(txtout)
+                    if i == 0:
+                        top_pose = pose
+                    if pose.count >= (top_pose.count-top_count_threshold) \
+                        and pose.score < (top_pose.score+top_score_threshold):
+                        pdbfile = save_as_pdb(pose, pose_idx)
+                        print(" >> " + pdbfile)
+                        f.write(" >> %s\n" % pdbfile)
+                        pose_idx += 1
+                    else:
+                        print()
+                        f.write("\n")
+                print()
+                f.write("\n")
+            print("="*80)
+            f.write("="*80+"\n")
+
+if __name__ == "__main__" :
+    main()

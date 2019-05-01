@@ -1,0 +1,100 @@
+#!/usr/bin/env /home/shbae/anaconda3/envs/work/bin/python
+
+import sys
+import os
+import subprocess
+from rdkit import Chem
+from rdkit.Chem import AllChem, rdMolDescriptors
+
+pythonsh_path = "/home/shbae/bin/mgltools-1.5.7rc1/bin/pythonsh"
+prepare_ligand4_path = "/home/shbae/bin/autodock4/prepare_ligand4.py"
+
+def generate_3d(smi, name, output_dir, ff='MMFF', save_pdbqt=True):
+    m = Chem.MolFromSmiles(smi)
+    m.SetProp("_Name", name)
+
+    # calculate energy minimized 3D coordinates
+    m = Chem.AddHs(m)
+    AllChem.EmbedMolecule(m,randomSeed=0x100d,
+	useExpTorsionAnglePrefs=True, useBasicKnowledge=True)
+    if ff == 'MMFF':
+        AllChem.MMFFOptimizeMolecule(m,maxIters=5000)
+    elif ff == 'UFF':
+        AllChem.UFFOptimizeMolecule(m,maxIters=5000)
+
+    # calculate radius of gyration
+    # optimal box size for Autodock Vina is 2.9 times of Rg
+    # Feinstein and Brylinski (2015), J. Cheminfo. 7:18
+    # DOI: 10.1186/s13321-015-0067-5
+
+    Rg = rdMolDescriptors.CalcRadiusOfGyration(m)
+    boxsize = Rg * 2.857
+
+    if save_pdbqt :
+        pdb_file = os.path.join(output_dir,name+".pdb")
+        pdbqt_file = os.path.join(output_dir,name+".pdbqt")
+        Chem.MolToPDBFile(m, pdb_file, flavor=4)
+
+        # prepare_ligand4.py
+        #
+        # Input
+        # The input file should contain only one molecule, which will be formatted as the ligand.
+        # Ideally, it should already have all hydrogens added (but see option '-A' below).
+        # -l     ligand_filename (.pdb or .mol2 or .pdbq format)
+        #
+        # Output
+        # The output filename default is the input file stem plus .pdbqt.
+        # For example, 'ind.pdb' by default is written to 'ind.pdbqt'.
+        #
+        # Options
+        # -A <option>
+        # -A 'hydrogens'
+        # adds hydrogens. PyBabel is used for adding all hydrogens, not just polar-hydrogens
+        # -A 'bonds'
+        # if, after having built bonds by-distance, there are any atoms that do not have any bonds,
+        # this builds a bond between each of these atoms and the atom nearest to it.
+        # This is necessary for building the torsion tree.
+        # -A 'hydrogens_bonds'
+        # adds hydrogens and builds bonds to any non-bonded atoms.
+        # (The default is not to perform any repairs, i.e. to not add hydrogens and not build bonds.)
+
+        cmd  = [ pythonsh_path,
+                 prepare_ligand4_path,
+                 "-l", pdb_file ,
+                 "-o", pdbqt_file,
+                 "-A", "bonds_hydrogens",
+                 ]
+        x=subprocess.Popen(cmd,stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+        out = [x.decode("utf-8") for x in x.stdout.readlines()]
+        err = [x.decode("utf-8") for x in x.stderr.readlines()]
+        if len(out) > 1 or len(err) > 0 :
+            print("".join(out))
+            print("".join(err))
+        else:
+            with open(pdbqt_file,"a") as f:
+                f.write("REMARK  optimal box size %.2f (Rg= %.3f)" % (boxsize,Rg))
+                f.write(" Feinstein and Brylinski (2015)")
+            print("%-10s Rg= %.3f size= %.2f  --->  %s" %
+                  (name, Rg, boxsize, pdbqt_file))
+    else:
+        print("%-10s Rg= %.3f size= %.2f" % (name, Rg, boxsize))
+
+def main() :
+    for smifilename in sys.argv[1:]:
+        try:
+            f = open(smifilename, "r")
+        except:
+            print("cannot open SMILES file", smifilename)
+            continue
+        output_dir = os.path.dirname(smifilename)
+        for line in f:
+            try:
+                smi, name = line.strip().split()
+            except:
+                smi = line.strip()
+                name = os.path.basename(smifilename).split(".")[0]
+            generate_3d(smi, name, output_dir)
+
+if __name__ == '__main__':
+    main()
